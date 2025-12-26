@@ -1,0 +1,181 @@
+﻿#include "d3d_init.h"
+#include "textures.h"
+
+using namespace DirectX;
+
+static void DebugFormat(const TexMetadata& m, const std::wstring& file) {
+    std::wstringstream wss;
+    wss << L"WIC loaded: " << file
+        << L"\n  size = " << m.width << L"x" << m.height
+        << L", mips = " << m.mipLevels
+        << L", array = " << m.arraySize
+        << L", fmt = " << (int)m.format << L"\n";
+    OutputDebugStringW(wss.str().c_str());
+}
+
+ScratchImage LoadTextureFile(const std::wstring& filename)
+{
+    if (GetFileAttributesW(filename.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+        std::wstringstream wss;
+        wss << L"File not found: " << filename << L"\nWorking dir: " << cwd << L"\n";
+        OutputDebugStringW(wss.str().c_str());
+        throw std::runtime_error("Texture file not found");
+    }
+
+    ScratchImage out;
+
+    if (filename.size() >= 4 &&
+        _wcsicmp(filename.c_str() + filename.size() - 4, L".dds") == 0)
+    {
+        ThrowIfFailedEx(LoadFromDDSFile(filename.c_str(), DDS_FLAGS_NONE, nullptr, out),
+            L"LoadFromDDSFile");
+        return out;
+    }
+
+    ScratchImage wic;
+    ThrowIfFailedEx(LoadFromWICFile(filename.c_str(), WIC_FLAGS_NONE, nullptr, wic),
+        L"LoadFromWICFile");
+
+    const TexMetadata meta = wic.GetMetadata();
+    DebugFormat(meta, filename);
+
+    switch (meta.format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        out = std::move(wic);
+        return out;
+    default:
+        break;
+    }
+
+    HRESULT hr = Convert(wic.GetImages(), wic.GetImageCount(), meta,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        TEX_FILTER_DEFAULT, 0.5f, out);
+    if (FAILED(hr)) {
+        OutputDebugStringW(L"Convert -> RGBA8 failed, try BGRA8...\n");
+        ThrowIfFailedEx(Convert(wic.GetImages(), wic.GetImageCount(), meta,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            TEX_FILTER_DEFAULT, 0.5f, out),
+            L"Convert->BGRA8");
+    }
+    return out;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE SRV_CPU(UINT index) {
+    auto base = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    base.ptr += SIZE_T(index) * g_srvInc;
+    return base;
+}
+static D3D12_GPU_DESCRIPTOR_HANDLE SRV_GPU(UINT index) {
+    auto base = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    base.ptr += UINT64(index) * g_srvInc;
+    return base;
+}
+
+UINT RegisterTextureFromFile(const std::wstring& path)
+{
+    using namespace DirectX;
+
+    ScratchImage img = LoadTextureFile(path);
+    TexMetadata meta = img.GetMetadata();
+
+    if (meta.mipLevels <= 1
+        && !IsCompressed(meta.format)
+        && meta.dimension == TEX_DIMENSION_TEXTURE2D
+        && meta.arraySize == 1)
+    {
+        ScratchImage mipChain;
+        HRESULT hr = GenerateMipMaps(
+            img.GetImages(), img.GetImageCount(), meta,
+            TEX_FILTER_FANT, 0, mipChain);
+        if (SUCCEEDED(hr)) {
+            img = std::move(mipChain);
+            meta = img.GetMetadata();
+        }
+    }
+
+    ComPtr<ID3D12Resource> tex;
+    {
+        auto desc = CD3DX12_RESOURCE_DESC::Tex2D(
+            meta.format,
+            meta.width, (UINT)meta.height,
+            (UINT16)meta.arraySize,
+            (UINT16)meta.mipLevels
+        );
+
+        CD3DX12_HEAP_PROPERTIES heapDefault(D3D12_HEAP_TYPE_DEFAULT);
+        HR(g_device->CreateCommittedResource(
+            &heapDefault, D3D12_HEAP_FLAG_NONE,
+            &desc, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, IID_PPV_ARGS(&tex)));
+    }
+
+    ComPtr<ID3D12Resource> up;
+    {
+        UINT numSubs = (UINT)img.GetImageCount();
+        UINT64 uploadSize = GetRequiredIntermediateSize(tex.Get(), 0, numSubs);
+
+        CD3DX12_HEAP_PROPERTIES heapUpload(D3D12_HEAP_TYPE_UPLOAD);
+        auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadSize);
+        HR(g_device->CreateCommittedResource(
+            &heapUpload, D3D12_HEAP_FLAG_NONE,
+            &bufDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&up)));
+    }
+
+    HR(g_uploadAlloc->Reset());
+    HR(g_uploadList->Reset(g_uploadAlloc.Get(), nullptr));
+
+    auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(
+        tex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    g_uploadList->ResourceBarrier(1, &toCopy);
+
+    std::vector<D3D12_SUBRESOURCE_DATA> subs;
+    PrepareUpload(g_device.Get(), img.GetImages(), img.GetImageCount(), meta, subs);
+
+    UpdateSubresources(g_uploadList.Get(), tex.Get(), up.Get(),
+        0, 0, (UINT)subs.size(), subs.data());
+
+    auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+        tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    g_uploadList->ResourceBarrier(1, &toSRV);
+
+    HR(g_uploadList->Close());
+    {
+        ID3D12CommandList* lists[] = { g_uploadList.Get() };
+        g_cmdQueue->ExecuteCommandLists(1, lists);
+    }
+    WaitForGPU();
+
+    auto ToSRGB = [](DXGI_FORMAT f) {
+        switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        default: return f;
+        }
+        };
+
+    UINT slot = SRV_Alloc();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = meta.format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = (UINT)meta.mipLevels;
+
+    g_device->CreateShaderResourceView(tex.Get(), &srvDesc, SRV_CPU(slot));
+
+    TextureGPU t{};
+    t.res = tex;
+    t.cpu = SRV_CPU(slot);
+    t.gpu = SRV_GPU(slot);
+
+    g_textures.push_back(t);
+
+    return (UINT)g_textures.size() - 1;
+}
